@@ -1,21 +1,20 @@
-# Razor Enhanced Lumberjacking Script (v6.3)
+# Razor Enhanced Lumberjacking Script (v8.6 - Y-Coordinate Boundary)
 #
 # What it does:
-# 1. Automatically finds and uses the axe in your right hand.
-# 2. Scans for the nearest tree, pathfinds to it, and chops it until depleted.
-# 3. Remembers which trees are depleted to avoid getting stuck.
-# 4. Automatically finds and equips a new axe if your current one breaks.
-# 5. When your backpack is full of logs, it converts them to boards.
-# 6. When your backpack is full of boards, it runs to your house, adjusts position, and deposits boards.
-# 7. If attacked, it will flee to your house for safety.
-# 8. When out of trees or axes, it will run home and deposit before stopping.
+# 1. Prompts you to target your axe to ensure a stable start.
+# 2. Uses the robust PathFinding module for all movement.
+# 3. Scans for the nearest tree, ignoring any trees outside the defined boundaries.
+# 4. Remembers which trees are depleted to avoid getting stuck.
+# 5. Automatically finds and equips a new axe if your current one breaks.
+# 6. When your backpack is full, it makes boards. If still full, it runs to your house and deposits.
+# 7. After depositing, it returns to a static, safe spot in the forest.
+# 8. If attacked, it will flee to your house for safety.
 #
 # How to use:
-# 1. IMPORTANT: Fill out the house coordinates and your crate's serial number in the Configuration section.
+# 1. IMPORTANT: Fill out the house and forest coordinates in the Configuration section.
 # 2. Place this script in your Razor Enhanced 'Scripts' folder.
-# 3. Equip an axe in your right hand. Have more axes in your backpack.
-# 4. Stand in a forested area and run the script.
-# 5. To stop, you must manually stop it from the Razor Enhanced scripts tab.
+# 3. Stand in a forested area and run the script. It will prompt you for your axe.
+# 4. To stop, you must manually stop it from the Razor Enhanced scripts tab.
 
 import sys
 import math
@@ -25,6 +24,10 @@ import math
 # The coordinates of a safe spot at your house (e.g., on your porch).
 HOUSE_X = 1658
 HOUSE_Y = 1225
+
+# A static, safe coordinate in the forest to return to after banking.
+FOREST_RETURN_X = 1661
+FOREST_RETURN_Y = 1255
 
 # The serial number of your secure crate for unloading.
 # Use Razor's inspector to get this number (e.g., 0x400123AB)
@@ -47,6 +50,9 @@ WEIGHT_LIMIT_OFFSET = 25
 # Delay in milliseconds after each chop/craft attempt.
 ACTION_DELAY = 3500
 
+# The time (in milliseconds) to wait for your character to walk back from the house.
+RETURN_WALK_TIMEOUT = 30000
+
 # A list of static tile IDs for various tree types.
 TREE_GRAPHICS = [
     0x0CCA, 0x0CCB, 0x0CCC, 0x0CCD, 0x0CD0, 0x0CD3, 0x0CD6, 0x0CD8,
@@ -55,32 +61,6 @@ TREE_GRAPHICS = [
 ]
 
 # --- Helper Functions ---
-
-def smart_move(x, y, z):
-    """
-    Intelligently moves the player, using the best pathfinding method based on distance.
-    Returns True on success, False on failure.
-    """
-    distance = math.sqrt((Player.Position.X - x)**2 + (Player.Position.Y - y)**2)
-    
-    # If the distance is short (likely on-screen), use the simpler method.
-    if distance < 16:
-        Player.PathFindTo(x, y, z)
-        # Give it a generous pause to complete the short walk.
-        Misc.Pause(int(distance * 600)) # Adjust multiplier as needed
-        # Check if we made it close enough
-        final_dist = math.sqrt((Player.Position.X - x)**2 + (Player.Position.Y - y)**2)
-        if final_dist > 3:
-            Misc.SendMessage(">> Short-distance pathfinding failed.", 138)
-            return False
-        return True
-    # If the distance is long, use the more robust method.
-    else:
-        path = PathFinding.GetPath(x, y, True)
-        if not path or not PathFinding.RunPath(path, 60.0, False, False):
-            Misc.SendMessage(">> Long-distance pathfinding failed.", 33)
-            return False
-        return True
 
 def find_and_equip_new_axe():
     """Finds a new axe in the backpack and equips it."""
@@ -94,7 +74,7 @@ def find_and_equip_new_axe():
     return 0
 
 def make_boards(axe_serial):
-    """Finds all logs in the backpack and converts them to boards."""
+    """Finds all logs in the backpack and converts them to boards using a stable loop."""
     Misc.SendMessage(">> Making boards...", 68)
     while True:
         if Items.FindBySerial(axe_serial) is None:
@@ -102,10 +82,12 @@ def make_boards(axe_serial):
             if axe_serial == 0:
                 Misc.SendMessage(">> Out of axes while making boards!", 33)
                 return 0
-        logs = Items.FindByID(LOG_GRAPHIC, -1, Player.Backpack.Serial)
+        
+        logs = Items.FindByID(LOG_GRAPHIC, -1, Player.Backpack.Serial, True)
         if logs is None:
             Misc.SendMessage(">> Finished making boards.", 68)
             break
+            
         Items.UseItem(axe_serial)
         if Target.WaitForTarget(2000):
             Target.TargetExecute(logs.Serial)
@@ -133,7 +115,7 @@ def find_walkable_neighbor(x, y):
     return (None, None)
 
 def find_closest_tree(ignore_list):
-    """Finds the closest reachable tree that is not on the ignore list."""
+    """Finds the closest reachable tree that is not on the ignore list or past the boundaries."""
     closest_tree = None
     min_dist = float('inf')
     tree_x, tree_y = 0, 0
@@ -141,6 +123,15 @@ def find_closest_tree(ignore_list):
         for y in range(Player.Position.Y - TREE_SEARCH_RADIUS, Player.Position.Y + TREE_SEARCH_RADIUS + 1):
             if (x, y) in ignore_list:
                 continue
+            
+            # Check if the tree is past our hard X-coordinate boundary.
+            if x >= 1659:
+                continue # This tree is too far east, skip it.
+                
+            # NEW: Check if the tree is past our hard Y-coordinate boundary.
+            if y < 1260:
+                continue # This tree is too far south, skip it.
+
             tile_info_list = Statics.GetStaticsTileInfo(x, y, Player.Map)
             for tile in tile_info_list:
                 if tile.StaticID in TREE_GRAPHICS:
@@ -156,12 +147,11 @@ def find_closest_tree(ignore_list):
         return (None, 0, 0)
 
 def go_to_house_and_deposit(crate_serial):
-    """Saves location, goes to the house, deposits boards, and returns."""
-    Misc.SendMessage(">> Full of boards! Running to the house.", 68)
-    start_x, start_y = Player.Position.X, Player.Position.Y
+    """Goes to the house, deposits resources, and returns to a static forest spot."""
+    Misc.SendMessage(">> Full! Running to the house.", 68)
     
-    # Pathfind to house
-    if not smart_move(HOUSE_X, HOUSE_Y, Player.Position.Z):
+    path = PathFinding.GetPath(HOUSE_X, HOUSE_Y, True)
+    if not path or not PathFinding.RunPath(path, 60.0, False, False):
         Misc.SendMessage(">> Failed to find a path to the house! Stopping script.", 33)
         return False
 
@@ -169,34 +159,28 @@ def go_to_house_and_deposit(crate_serial):
     Misc.SendMessage(">> Arrived at house. Adjusting position...", 68)
     for i in range(5):
         Player.Run("North")
-        Misc.Pause(200)
+        Misc.Pause(500)
         
-    # Add a delay after arriving at the house
     Misc.SendMessage(">> Pausing before deposit...", 68)
     Misc.Pause(5000)
 
-    # Deposit boards into the specified crate
+    # Deposit boards and logs into the specified crate
     while True:
         boards = Items.FindByID(BOARD_GRAPHIC, -1, Player.Backpack.Serial)
-        if boards is None:
+        logs = Items.FindByID(LOG_GRAPHIC, -1, Player.Backpack.Serial)
+        if boards is None and logs is None:
             break
-        Items.Move(boards, crate_serial, 0)
+        if boards: Items.Move(boards, crate_serial, 0)
+        if logs: Items.Move(logs, crate_serial, 0)
         Misc.Pause(1000)
-    Misc.SendMessage(">> Finished depositing boards.", 68)
+    Misc.SendMessage(">> Finished depositing resources.", 68)
     
-    # Added 3-second delay after depositing
     Misc.Pause(3000)
 
-    # Pathfind back to lumberjacking spot
-    Misc.SendMessage(">> Returning to the forest...", 78)
-    return_x, return_y = find_walkable_neighbor(start_x, start_y)
-    if return_x is None:
-        Misc.SendMessage(">> Cannot find a walkable spot to return to! Stopping.", 33)
-        return False
-        
-    if not smart_move(return_x, return_y, Player.Position.Z):
-        Misc.SendMessage(">> Failed to find a path back to the forest! Stopping script.", 33)
-        return False
+    # Pathfind back to the static forest spot using the simple method
+    Misc.SendMessage(">> Returning to the forest at X:{} Y:{}".format(FOREST_RETURN_X, FOREST_RETURN_Y), 78)
+    Player.PathFindTo(FOREST_RETURN_X, FOREST_RETURN_Y, Player.Position.Z)
+    Misc.Pause(RETURN_WALK_TIMEOUT)
         
     return True
 
@@ -206,7 +190,8 @@ def go_home_and_finish(crate_serial, axe_serial):
     axe_serial = make_boards(axe_serial)
 
     Misc.SendMessage(">> Running to the house.", 68)
-    if not smart_move(HOUSE_X, HOUSE_Y, Player.Position.Z):
+    path = PathFinding.GetPath(HOUSE_X, HOUSE_Y, True)
+    if not path or not PathFinding.RunPath(path, 60.0, False, False):
         Misc.SendMessage(">> Failed to find a path home! Stopping in place.", 33)
         return
 
@@ -214,32 +199,35 @@ def go_home_and_finish(crate_serial, axe_serial):
     Misc.SendMessage(">> Arrived at house. Adjusting position...", 68)
     for i in range(5):
         Player.Run("North")
-        Misc.Pause(200)
+        Misc.Pause(500)
 
-    if Items.FindByID(BOARD_GRAPHIC, -1, Player.Backpack.Serial) is not None:
+    if Items.FindByID(BOARD_GRAPHIC, -1, Player.Backpack.Serial) is not None or Items.FindByID(LOG_GRAPHIC, -1, Player.Backpack.Serial) is not None:
         Misc.SendMessage(">> Depositing final load.", 68)
         while True:
             boards = Items.FindByID(BOARD_GRAPHIC, -1, Player.Backpack.Serial)
-            if boards is None:
+            logs = Items.FindByID(LOG_GRAPHIC, -1, Player.Backpack.Serial)
+            if boards is None and logs is None:
                 break
-            Items.Move(boards, crate_serial, 0)
+            if boards: Items.Move(boards, crate_serial, 0)
+            if logs: Items.Move(logs, crate_serial, 0)
             Misc.Pause(1000)
         Misc.SendMessage(">> Finished depositing final load.", 68)
     else:
-        Misc.SendMessage(">> No final boards to deposit.", 68)
+        Misc.SendMessage(">> No final resources to deposit.", 68)
 
 def check_health_and_flee():
     """Checks player health and flees to the house if necessary."""
     if Player.Hits < (Player.HitsMax * (FLEE_HEALTH_PERCENT / 100.0)):
         Misc.SendMessage(">> Health is low! Fleeing to the house!", 33)
-        if not smart_move(HOUSE_X, HOUSE_Y, Player.Position.Z):
+        path = PathFinding.GetPath(HOUSE_X, HOUSE_Y, True)
+        if not path or not PathFinding.RunPath(path, 60.0, False, False):
             Misc.SendMessage(">> Flee path failed! Trying to manually escape.", 33)
         
         # Adjust position after arriving
         Misc.SendMessage(">> Arrived at house. Adjusting position...", 68)
         for i in range(5):
             Player.Run("North")
-            Misc.Pause(200)
+            Misc.Pause(500)
             
         Misc.SendMessage(">> Arrived at house safely. Stopping script.", 68)
         sys.exit() # Stop the script for safety
@@ -247,18 +235,15 @@ def check_health_and_flee():
 # --- Main Script ---
 
 Misc.SendMessage(">> Starting Lumberjacking Script...", 68)
-Misc.Pause(500)
+Misc.Pause(1500) # Increased initial pause for stability
 
 # Initial Setup
-equipped_axe = Player.GetItemOnLayer('RightHand')
-if equipped_axe is None:
-    equipped_axe = Player.GetItemOnLayer('LeftHand')
-if equipped_axe is None:
-    Misc.SendMessage(">> No axe equipped in either hand! Stopping script.", 33)
+Misc.SendMessage(">> Please target your first axe.", 68)
+axe_serial = Target.PromptTarget()
+if axe_serial == 0:
+    Misc.SendMessage(">> Canceled. No axe selected.", 33)
     sys.exit()
-if equipped_axe.ItemID not in AXE_GRAPHICS:
-    AXE_GRAPHICS.append(equipped_axe.ItemID)
-axe_serial = equipped_axe.Serial
+
 depleted_trees = []
 
 # Main Loop
@@ -293,31 +278,41 @@ while True:
         depleted_trees.append((tree_x, tree_y))
         continue
 
-    if not smart_move(walk_to_x, walk_to_y, Player.Position.Z):
+    path = PathFinding.GetPath(walk_to_x, walk_to_y, True)
+    if not path or not PathFinding.RunPath(path, 15.0, False, False):
         depleted_trees.append((tree_x, tree_y))
         continue
         
     Misc.Pause(500)
 
+    # Dedicated loop for chopping a single tree until it is empty.
     while True:
-        check_health_and_flee() # Check health between each chop
+        # Check for overweight or broken axe before each chop.
         if Player.Weight >= (Player.MaxWeight - WEIGHT_LIMIT_OFFSET):
-            break
+            Misc.SendMessage(">> Overweight, stopping chop on this tree.", 68)
+            break # Exit inner loop to trigger board making/banking
         if Items.FindBySerial(axe_serial) is None:
-            break
+            Misc.SendMessage(">> Axe broke, stopping chop on this tree.", 138)
+            break # Exit inner loop to find a new axe
 
         Journal.Clear()
         Items.UseItem(axe_serial)
         if Target.WaitForTarget(2000):
             Target.TargetExecute(tree_x, tree_y, tree.StaticZ, tree.StaticID)
         else:
-            break
-        Misc.Pause(ACTION_DELAY)
-        
-        if (Journal.Search("There are no logs left") or 
-                Journal.Search("That is too far away") or 
-                Journal.Search("There's not enough wood here to harvest")):
+            Misc.SendMessage(">> Error: Timed out waiting for target.", 33)
             depleted_trees.append((tree_x, tree_y))
             break
 
+        Misc.Pause(ACTION_DELAY)
+        
+        # Check journal messages to see if the tree is depleted
+        if (Journal.Search("There are no logs left") or 
+                Journal.Search("That is too far away") or 
+                Journal.Search("There's not enough wood here to harvest")):
+            Misc.SendMessage(">> Tree depleted. Finding new tree.", 78)
+            depleted_trees.append((tree_x, tree_y))
+            break # Exit inner loop to find a new tree
+
 Misc.SendMessage(">> Lumberjacking script finished.", 68)
+
