@@ -1,4 +1,6 @@
 '''
+Version: 1.9
+Date: July 19, 2025
 Author: Aga - original author of the uosteam script
 Other Contributors: TheWarDoctorDoctor95 - converted to Razor Enhanced script
 Last Contribution By: TheWarDoctor95 - March 19, 2019
@@ -30,15 +32,15 @@ numberOfFollowersToKeep = 1
 maximumTameAttempts = 15
 # Set the minimum taming difficulty to use when finding animals to tame
 minimumTamingDifficulty = 10.0
-# MODIFIED: Set the maximum taming difficulty relative to your current skill level.
-# A value of 10.0 would let the script try to tame creatures up to 10 points
-# higher than your skill. Set to 0.0 to only tame creatures at or below your skill level.
+# Set the maximum taming difficulty relative to your current skill level.
 maximumDifficultyOffset = 0.0
 # Set this to how you would like to heal your character if they take damage
 # Options are: 'Healing', 'Magery', 'None'
-healUsing = 'None'
+healUsing = 'Magery'
 # True or False to use Peacemaking if needed
 enablePeacemaking = False
+# Set to True to automatically attack creatures that attack you.
+defendYourself = True
 # True or False to track the animal being tamed
 enableFollowAnimal = True
 # Change depending on the latency to your UO shard
@@ -138,26 +140,14 @@ tameable_data = {
 }
 
 # --- Timers ---
-noAnimalsToTrainTimerMilliseconds = 10000
-catchUpToAnimalTimerMilliseconds = 20000
-animalTamingTimerMilliseconds = 13000
-peacemakingTimerMilliseconds = 10000
-bandageTimerMilliseconds = 5000
-
-# --- Globals for script logic ---
 recently_tamed_serials = []
 
 
 def GetAnimalsInSkillRange(min_difficulty, max_offset):
-    """
-    Gets a list of Body IDs for animals that are within the player's tameable range.
-    """
     animal_ids = List[Int32]()
     current_skill = Player.GetSkillValue('Animal Taming')
     max_difficulty = current_skill + max_offset
-    
     Misc.SendMessage("Current Taming: %.1f. Targeting difficulty range: %.1f to %.1f" % (current_skill, min_difficulty, max_difficulty), 90)
-
     for body_id, tame_diff in tameable_data.items():
         if tame_diff >= min_difficulty and tame_diff <= max_difficulty:
             animal_ids.Add(body_id)
@@ -174,11 +164,7 @@ def FindInstrument():
     return None
 
 def FindAnimalToTame():
-    '''
-    Finds the best animal to tame nearby, prioritizing the highest difficulty for skill gain.
-    '''
     global minimumTamingDifficulty, recently_tamed_serials, maximumDifficultyOffset
-
     animalFilter = Mobiles.Filter()
     animalFilter.Enabled = True
     animalFilter.Bodies = GetAnimalsInSkillRange(minimumTamingDifficulty, maximumDifficultyOffset)
@@ -187,49 +173,107 @@ def FindAnimalToTame():
     animalFilter.IsHuman = 0
     animalFilter.IsGhost = 0
     animalFilter.CheckIgnoreObject = True
-
     tameableMobiles = Mobiles.ApplyFilter(animalFilter)
-    
     valid_mobiles = []
     for mobile in tameableMobiles:
         if not (mobile.Name in petsToIgnore or mobile.Serial in recently_tamed_serials):
             valid_mobiles.append(mobile)
-
     if not valid_mobiles:
         return None
-
     best_target = None
     highest_difficulty = -1.0
-
     for mobile in valid_mobiles:
         difficulty = tameable_data.get(mobile.Body, -1.0)
-        
         if difficulty > highest_difficulty:
             highest_difficulty = difficulty
             best_target = mobile
         elif difficulty == highest_difficulty:
             if best_target is None or Player.DistanceTo(mobile) < Player.DistanceTo(best_target):
                 best_target = mobile
-                
     return best_target
 
-
 def FollowMobile(mobile, maxDistanceToMobile=2):
-    Timer.Create('catchUpToAnimalTimer', catchUpToAnimalTimerMilliseconds)
+    Timer.Create('catchUpToAnimalTimer', 20000)
     while Player.DistanceTo(mobile) > maxDistanceToMobile:
         if not Timer.Check('catchUpToAnimalTimer'):
-            Misc.SendMessage('Timeout while trying to follow mobile.', 33)
             return False
         Player.PathFindTo(mobile.Position.X, mobile.Position.Y, mobile.Position.Z)
         Misc.Pause(1000)
         if not Mobiles.FindBySerial(mobile.Serial):
-            Misc.SendMessage('Mobile disappeared while following.', 33)
             return False
+    return True
+
+def HandleAttackers():
+    attacker = None
+    last_attacker_serial = Target.GetLastAttack()
+    
+    if last_attacker_serial != 0:
+        attacker = Mobiles.FindBySerial(last_attacker_serial)
+
+    if not (attacker and attacker.Hits > 0):
+        hostile_filter = Mobiles.Filter()
+        hostile_filter.Enabled = True
+        hostile_filter.RangeMax = 12
+        hostile_filter.Notorieties = List[Byte]([Byte(n) for n in [3, 4, 5, 6]])
+        hostiles = Mobiles.ApplyFilter(hostile_filter)
+        
+        if hostiles:
+            for hostile in hostiles:
+                if hostile.WarMode:
+                    attacker = hostile
+                    break
+            if not attacker:
+                attacker = Mobiles.Select(hostiles, 'Nearest')
+
+    if not (attacker and attacker.Hits > 0):
+        Target.ClearLastAttack()
+        return False
+        
+    Misc.SendMessage("Damage detected! Defending against: %s" % attacker.Name, 33)
+    
+    while Mobiles.FindBySerial(attacker.Serial) and attacker.Hits > 0 and Player.DistanceTo(attacker) < 15:
+        Journal.Clear()
+        
+        if Player.Hits < (Player.HitsMax * 0.65):
+            if Player.Mana >= 11:
+                Spells.CastMagery('Greater Heal', Player.Serial)
+                Misc.Pause(250)
+                if Journal.Search("not yet recovered"):
+                    Misc.Pause(1000)
+                else:
+                    Misc.Pause(2000)
+                continue
+            else:
+                Misc.Pause(2000)
+
+        elif Player.Mana >= 20:
+            Spells.CastMagery('Energy Bolt', attacker)
+            if Journal.Search("not yet recovered"):
+                Misc.Pause(1000)
+            else:
+                Misc.Pause(2500)
+        else:
+            Misc.Pause(3000)
+            
+    Misc.SendMessage("Threat neutralized. Topping up health...", 66)
+    Target.ClearLastAttack()
+    
+    while Player.Hits < Player.HitsMax:
+        if Player.Mana >= 11:
+            Journal.Clear()
+            Spells.CastMagery('Greater Heal', Player.Serial)
+            Misc.Pause(250)
+            if Journal.Search("not yet recovered"):
+                Misc.Pause(1000)
+            else:
+                Misc.Pause(2000)
+        else:
+            break
     return True
 
 def TrainAnimalTaming():
     global renameTamedAnimalsTo, numberOfFollowersToKeep, maximumTameAttempts
-    global enablePeacemaking, enableFollowAnimal, healUsing, recently_tamed_serials
+    global enablePeacemaking, enableFollowAnimal, healUsing, recently_tamed_serials, defendYourself
 
     if Player.GetRealSkillValue('Animal Taming') >= Player.GetSkillCap('Animal Taming'):
         Misc.SendMessage("You've already maxed out Animal Taming!", 65)
@@ -238,17 +282,28 @@ def TrainAnimalTaming():
     animalBeingTamed = None
     timesTried = 0
     Timer.Create('animalTamingTimer', 1)
-    if enablePeacemaking:
-        Timer.Create('peacemakingTimer', 1)
     if healUsing == 'Healing':
         Timer.Create('bandageTimer', 1)
 
     Journal.Clear()
     Misc.ClearIgnore()
     Player.SetWarMode(False)
+    
+    last_health = Player.Hits
 
     while not Player.IsGhost and Player.GetRealSkillValue('Animal Taming') < Player.GetSkillCap('Animal Taming'):
-        Misc.Pause(100)
+        Misc.Pause(250) # A short, consistent pause for the loop
+
+        # REVISED: Health check is now the FIRST action in every loop.
+        current_health = Player.Hits
+        if defendYourself and current_health < last_health:
+            if HandleAttackers():
+                animalBeingTamed = None # Stop taming to handle the threat
+                last_health = Player.Hits # IMPORTANT: Update health after combat
+                continue # Restart the loop from the top
+        
+        # Update health tracker for the next loop iteration
+        last_health = current_health
 
         if animalBeingTamed and not Mobiles.FindBySerial(animalBeingTamed.Serial):
             animalBeingTamed = None
@@ -259,33 +314,12 @@ def TrainAnimalTaming():
             timesTried = 0
             continue
         
-        if enablePeacemaking and not Timer.Check('peacemakingTimer') and Journal.Search("is attacking you!"):
-            instrument = FindInstrument()
-            if instrument:
-                Player.UseSkill('Peacemaking')
-                Target.WaitForTarget(1000, False)
-                Target.Self()
-                Timer.Create('peacemakingTimer', peacemakingTimerMilliseconds)
-                Misc.Pause(3000)
+        if Player.Hits < (Player.HitsMax * 0.65) and healUsing == 'Magery':
+            if Player.Mana >= 11:
+                Spells.CastMagery('Greater Heal', Player.Serial)
+                Misc.Pause(2000)
             else:
-                Misc.SendMessage('No instrument found to use Peacemaking!', 33)
-
-        if Player.Hits < Player.HitsMax and healUsing != 'None':
-            if healUsing == 'Healing' and not Timer.Check('bandageTimer'):
-                bandage = FindBandage()
-                if bandage:
-                    Items.UseItem(bandage)
-                    Target.WaitForTarget(1000, False)
-                    Target.Self()
-                    Timer.Create('bandageTimer', bandageTimerMilliseconds)
-            elif healUsing == 'Magery':
-                required_mana = 11 if (Player.HitsMax - Player.Hits) > 30 else 4
-                if Player.Mana >= required_mana:
-                    spell = 'Greater Heal' if (Player.HitsMax - Player.Hits) > 30 else 'Heal'
-                    Spells.CastMagery(spell)
-                    Target.WaitForTarget(1000, False)
-                    Target.Self()
-                    Misc.Pause(2000)
+                Misc.SendMessage('Not enough mana to heal!', 33)
 
         if animalBeingTamed is None:
             animalBeingTamed = FindAnimalToTame()
@@ -315,14 +349,12 @@ def TrainAnimalTaming():
             Target.TargetExecute(animalBeingTamed)
             timesTried += 1
             
-            # MODIFIED: Increased max wait time to 15 seconds.
             max_wait_ms = 15000
-            wait_interval_ms = 500 # Using a slightly longer pause between checks
+            wait_interval_ms = 500
             time_waited = 0
             tame_result = "in_progress"
             
             while tame_result == "in_progress" and time_waited < max_wait_ms:
-                # First, check for a success or failure message to end the loop early.
                 if Journal.Search("It seems to accept you as master") or Journal.Search("That wasn't even challenging"):
                     tame_result = "success"
                     continue
@@ -330,11 +362,8 @@ def TrainAnimalTaming():
                     tame_result = "failure"
                     continue
                 
-                # MODIFIED: If still in progress, check distance and move closer without restarting.
                 if Player.DistanceTo(animalBeingTamed) > 4:
-                    Misc.SendMessage("Animal is moving, staying close...", 88)
                     Player.PathFindTo(animalBeingTamed.Position.X, animalBeingTamed.Position.Y, animalBeingTamed.Position.Z)
-                    # Pause after moving to allow character to catch up
                     Misc.Pause(wait_interval_ms) 
                 
                 Misc.Pause(wait_interval_ms)
@@ -374,6 +403,6 @@ def TrainAnimalTaming():
                     Misc.IgnoreObject(animalBeingTamed)
                 animalBeingTamed = None
             Timer.Create('animalTamingTimer', 2000)
-
+        
 # Start Animal Taming
 TrainAnimalTaming()
